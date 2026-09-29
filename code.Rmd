@@ -1,0 +1,1304 @@
+---
+title: "GSTFM replication toolkit (Barigozzi, La Vecchia & Liu) — coherent end-to-end R code"
+author: "Danaia Burtseva (refactored)"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+<!-- !!!Load workflow -->
+<!-- # ```{r} -->
+<!-- #  -->
+<!-- # load(".../workspace_snapshot.RData") -->
+<!-- #  -->
+<!-- #  -->
+<!-- # ``` -->
+
+# Annotation
+<!-- What this report replicates from Barigozzi, La Vecchia & Liu -->
+
+This document implements an end-to-end replication-style workflow for the General Spatio-Temporal Factor Model (GSTFM).
+
+The implementation follows the paper’s logic in three parts:
+
+1. **Simulation of a spatio-temporal factor random field** (Model (a)-type design): the observed field is decomposed into a structured “common component” plus an idiosyncratic noise component.
+
+2. **Figure 1-style diagnostic (GSTFM spectral eigenvalues on the lattice):**
+   we estimate a kernel-smoothed spectral density matrix \(\widehat{\Sigma}_x(\theta)\) on a 3D frequency grid and plot averaged eigenvalues as the cross-sectional dimension \(m\) increases. This reproduces the eigengap behavior used to identify the number of factors \(q\).
+
+3. **Figure 2-style diagnostic (stacked GDFM approach):**
+   we stack the lattice into a high-dimensional time series \(Z \in \mathbb{R}^{T\times N}\), estimate a standard lag-window spectral density for the stacked series, and show that the eigengap disappears as the stacked dimension grows, consistent with the paper’s motivation for GSTFM.
+
+
+<!-- ## Mapping of the estimator to the paper notation -->
+
+The paper defines the (population) spectral density matrix as
+\[
+\Sigma_x(\theta) = \sum_{h\in\mathbb{Z}^3} \Gamma_x(h)\, e^{-i\langle h,\theta\rangle}.
+\]
+
+In this report we estimate \(\widehat{\Gamma}_x(h)\) on a finite lag window and form
+\(\widehat{\Sigma}_x(\theta)\) by the same Fourier summation, using product taper weights (Bartlett or Epanechnikov).
+
+At each frequency \(\theta\), the top-\(q\) eigenvectors of \(\widehat{\Sigma}_x(\theta)\) define a rank-\(q\)spectral projector. In Algorithm 1 we transform these frequency-domain projectors back into a truncated spatio-temporal filter by a discrete Riemann approximation to the inverse Fourier integral,
+and apply the filter to reconstruct an estimate of the common component \(\widehat{\chi}\).
+
+
+The goal of this report is a clear and computationally stable implementation of the paper’s methodology. Some components (kernel types, grid resolution, truncation levels, and simulation hyperparameters) are chosen for reproducibility and laptop-scale runtime. Therefore results should match the paper qualitatively
+(e.g., presence/absence of eigengap), but numerical values may differ unless all tuning parameters and grid choices are aligned exactly with the authors’ settings.
+
+
+## Introduction
+
+Utilities: kernels, indexing, FFT helpers
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = FALSE,
+  fig.align = "center"
+)
+
+# Optional stability: prevent BLAS oversubscription on laptops
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  RhpcBLASctl::blas_set_num_threads(1)
+  RhpcBLASctl::omp_set_num_threads(1)
+}
+set.seed(123)
+
+
+# ----------- kernels -----------
+
+K_bartlett <- function(u) {
+au <- abs(u)
+ifelse(au <= 1, 1 - au, 0)
+}
+
+K_epan <- function(u) {
+au <- abs(u)
+ifelse(au <= 1, 0.75 * (1 - u^2), 0)
+}
+
+# ----------- periodic index wrap (1-based) -----------
+
+wrap_idx <- function(idx, L) ((idx - 1) %% L) + 1
+
+# ----------- 3D FFT helper (base R only) -----------
+
+# fft3d <- function(A) {
+#   stopifnot(length(dim(A)) == 3)
+#   fft(A)
+# }
+
+fft3d <- function(A) {
+  d <- dim(A)
+  stopifnot(length(d) == 3)
+
+  # FFT along dim 1
+  out <- array(0+0i, dim = d)
+  for (j in 1:d[2]) for (k in 1:d[3]) {
+    out[, j, k] <- fft(A[, j, k])
+  }
+
+  # FFT along dim 2
+  tmp <- array(0+0i, dim = d)
+  for (i in 1:d[1]) for (k in 1:d[3]) {
+    tmp[i, , k] <- fft(out[i, , k])
+  }
+
+  # FFT along dim 3
+  res <- array(0+0i, dim = d)
+  for (i in 1:d[1]) for (j in 1:d[2]) {
+    res[i, j, ] <- fft(tmp[i, j, ])
+  }
+
+  res
+}
+
+
+# ----------- robust Hermitian eigenvalues via real block (safe) -----------
+
+hermitian_eigvals_blockreal <- function(H) {
+H <- (H + Conj(t(H))) / 2
+A <- Re(H); B <- Im(H)
+Hreal <- rbind(cbind(A, -B),
+cbind(B,  A))
+vals <- eigen(Hreal, symmetric = TRUE, only.values = TRUE)$values
+vals <- sort(vals, decreasing = TRUE)
+vals[seq(1, length(vals), by = 2)]
+}
+
+
+```
+
+# The General Spatio‑Temporal Factor Model (GSTFM). Model A.
+
+
+At each space–time point \( \varsigma = (s_1, s_2, t) \), we observe an \( n \)-dimensional vector:
+\[
+x_{\ell,\varsigma} = \chi_{\ell,\varsigma} + \xi_{\ell,\varsigma},
+\]
+where \( \chi_{\ell,\varsigma} \) is the common component driven by \( q \) latent spatio‑temporal factors, and \( \xi_{\ell,\varsigma} \) is a weakly dependent idiosyncratic term.
+
+GSTFM allows factors to influence both neighboring locations and lagged times. The core idea is that the spectral density matrix of \( x \) exhibits exactly \( q \) diverging eigenvalues as the dimension \( n \to \infty \), while the remaining eigenvalues stay bounded. This separation — the **eigen‑gap** — identifies the number of common factors and represents a “blessing of dimensionality.”
+
+Why GSTFM Works (and GDFM Fails)
+
+
+## **Case 1: GSTFM simulation (Figure 1)**  
+As the sample dimension \( m \) increases, the first \( q \) eigenvalues of the spatio‑temporal spectral density rise quickly, while the \( (q\!+\!1) \)‑th grows slowly. The widening eigen‑gap indicates clearer separation between common and idiosyncratic components.
+
+
+ Torus FFT version (fast; periodic boundary)
+```{r}
+# Folded 1D kernel for torus length L, weights b^{|k|} folded to [0..L-1]
+
+make_torus_kernel <- function(L, b) {
+stopifnot(L >= 1, b > 0, b < 1)
+den <- 1 - b^L
+h <- numeric(L)
+h[1] <- (1 + b^L) / den
+if (L >= 2) {
+for (r in 1:(L - 1)) h[r + 1] <- (b^r + b^(L - r)) / den
+}
+h
+}
+
+make_kernel_3d_torus <- function(S1, S2, T, b) {
+h1 <- make_torus_kernel(S1, b)
+h2 <- make_torus_kernel(S2, b)
+h3 <- make_torus_kernel(T,  b)
+H12  <- outer(h1, h2)
+Kvec <- outer(as.vector(H12), h3)
+array(Kvec, dim = c(S1, S2, T))
+}
+
+circ_conv3d_fft <- function(U, K) {
+d <- dim(U)
+stopifnot(length(d) == 3, all(dim(K) == d))
+Re(fft(fft(U) * fft(K), inverse = TRUE) / prod(d))
+}
+
+simulate_model_a_torusfft <- function(n = 100, q = 2, S1 = 10, S2 = 10, T = 100,
+b_min = 0.5, b_max = 0.8,
+xi_sd = 1.0,
+seed = 123) {
+set.seed(seed)
+a <- matrix(rnorm(n*q), n, q)
+b <- matrix(runif(n*q, b_min, b_max), n, q)
+u <- array(rnorm(q*S1*S2*T), dim = c(q, S1, S2, T))
+chi <- array(0, dim = c(n, S1, S2, T))
+
+for (ell in 1:n) {
+for (j in 1:q) {
+K3 <- make_kernel_3d_torus(S1, S2, T, b[ell, j])
+Fj <- circ_conv3d_fft(u[j, , , ], K3)
+chi[ell, , , ] <- chi[ell, , , ] + a[ell, j] * Fj
+}
+}
+xi <- array(rnorm(n*S1*S2*T, sd = xi_sd), dim = c(n, S1, S2, T))
+x  <- chi + xi
+list(x=x, chi=chi, xi=xi, a=a, b=b, u=u, dims=c(n=n,q=q,S1=S1,S2=S2,T=T))
+}
+```
+ Truncated non-circular version (closer to infinite convolution)
+
+```{r}
+
+# Truncated kernel weights b^{|k1|+|k2|+|k3|} for |ki|<=K, used with zero-padding conv.
+
+# This is slower but closer to the paper's infinite sum.
+
+make_kernel_3d_trunc <- function(K, b) {
+grid <- -K:K
+w1 <- b^abs(grid)
+
+# separable in L1 norm: b^{|k1|+|k2|+|k3|} = w1(k1)*w1(k2)*w1(k3)
+
+K1 <- outer(w1, w1)                         # (2K+1) x (2K+1)
+Kvec <- outer(as.vector(K1), w1)            # (2K+1)^2 x (2K+1)
+array(Kvec, dim = c(2*K+1, 2*K+1, 2*K+1))
+}
+
+# zero-padded linear convolution via FFT:
+
+lin_conv3d_fft <- function(U, K) {
+dU <- dim(U); dK <- dim(K)
+stopifnot(length(dU)==3, length(dK)==3)
+out_dim <- dU + dK - 1
+pad <- function(A, dim_out) {
+B <- array(0, dim = dim_out)
+B[1:dim(A)[1], 1:dim(A)[2], 1:dim(A)[3]] <- A
+B
+}
+U2 <- pad(U, out_dim)
+K2 <- pad(K, out_dim)
+Re(fft(fft(U2) * fft(K2), inverse = TRUE) / prod(out_dim))
+}
+
+# crop "same" part to original U size (centered)
+
+crop_same <- function(F, dU, dK) {
+start <- floor(dK/2) + 1
+idx1 <- start[1]:(start[1]+dU[1]-1)
+idx2 <- start[2]:(start[2]+dU[2]-1)
+idx3 <- start[3]:(start[3]+dU[3]-1)
+F[idx1, idx2, idx3]
+}
+
+simulate_model_a_trunc <- function(n = 100, q = 2, S1 = 10, S2 = 10, T = 100,
+K = 6,
+b_min = 0.5, b_max = 0.8,
+xi_sd = 1.0,
+seed = 123) {
+set.seed(seed)
+a <- matrix(rnorm(n*q), n, q)
+b <- matrix(runif(n*q, b_min, b_max), n, q)
+u <- array(rnorm(q*S1*S2*T), dim = c(q, S1, S2, T))
+chi <- array(0, dim = c(n, S1, S2, T))
+
+for (ell in 1:n) {
+for (j in 1:q) {
+K3 <- make_kernel_3d_trunc(K, b[ell, j])
+Ffull <- lin_conv3d_fft(u[j, , , ], K3)
+Fj <- crop_same(Ffull, dU=c(S1,S2,T), dK=dim(K3))
+chi[ell, , , ] <- chi[ell, , , ] + a[ell, j] * Fj
+}
+}
+xi <- array(rnorm(n*S1*S2*T, sd = xi_sd), dim = c(n, S1, S2, T))
+x  <- chi + xi
+list(x=x, chi=chi, xi=xi, a=a, b=b, u=u, dims=c(n=n,q=q,S1=S1,S2=S2,T=T), K=K)
+}
+```
+
+Figure 1-style curves (GSTFM): eigen-gap vs m
+This uses a kernel-smoothed periodogram (fast, stable) and averages eigenvalues over frequencies.
+
+```{r}
+
+estimate_spec_density_kernel <- function(x, B = c(2,2,2),
+K1 = K_epan, K2 = K_epan, K3 = K_epan,
+eig_method = c("block","direct")) {
+eig_method <- match.arg(eig_method)
+stopifnot(length(dim(x)) == 4)
+n  <- dim(x)[1]; S1 <- dim(x)[2]; S2 <- dim(x)[3]; TT <- dim(x)[4]
+
+Xfft <- array(0+0i, dim = c(n, S1, S2, TT))
+for (ell in 1:n) Xfft[ell, , , ] <- fft3d(x[ell, , , ])
+
+periodogram_at <- function(k1,k2,k3) {
+v <- Xfft[, k1, k2, k3]
+(v %*% Conj(t(v))) / (S1*S2*TT)
+}
+
+smooth_at <- function(k1,k2,k3) {
+B1 <- B[1]; B2 <- B[2]; B3 <- B[3]
+acc <- matrix(0+0i, n, n)
+wsum <- 0
+for (d1 in -B1:B1) for (d2 in -B2:B2) for (d3 in -B3:B3) {
+w <- K1(d1/B1) * K2(d2/B2) * K3(d3/B3)
+if (w == 0) next
+kk1 <- wrap_idx(k1+d1, S1)
+kk2 <- wrap_idx(k2+d2, S2)
+kk3 <- wrap_idx(k3+d3, TT)
+acc <- acc + w * periodogram_at(kk1,kk2,kk3)
+wsum <- wsum + w
+}
+acc / wsum
+}
+
+eigvals <- array(NA_real_, dim = c(S1, S2, TT, n))
+for (k1 in 1:S1) for (k2 in 1:S2) for (k3 in 1:TT) {
+S_hat <- smooth_at(k1,k2,k3)
+S_hat <- (S_hat + Conj(t(S_hat))) / 2
+if (eig_method == "direct") {
+eigvals[k1,k2,k3,] <- eigen(S_hat, symmetric = TRUE, only.values = TRUE)$values
+} else {
+eigvals[k1,k2,k3,] <- hermitian_eigvals_blockreal(S_hat)
+}
+}
+list(eigvals=eigvals, dims=c(n=n,S1=S1,S2=S2,T=TT), B=B)
+}
+
+# optional coarse grid 5x5x5 over [0,pi]^3 like appendix implementations
+
+freq_subset_5cube <- function(S1,S2,T) {
+i1 <- unique(round(seq(1, floor(S1/2)+1, length.out = 5)))
+i2 <- unique(round(seq(1, floor(S2/2)+1, length.out = 5)))
+i3 <- unique(round(seq(1, floor(T /2)+1, length.out = 5)))
+list(i1=i1,i2=i2,i3=i3)
+}
+
+fig1_curves <- function(x_full, q, m_vec = 1:dim(x_full)[1],
+B = c(2,2,2),
+use_5cube = FALSE,
+permute_once = TRUE,
+eig_method="block") {
+
+n_tot <- dim(x_full)[1]
+stopifnot(max(m_vec) <= n_tot)
+
+if (permute_once) {
+set.seed(1)
+x_full <- x_full[sample.int(n_tot), , , , drop=FALSE]
+}
+
+out <- matrix(NA_real_, nrow=length(m_vec), ncol=q+1)
+colnames(out) <- paste0("lambda_", 1:(q+1))
+
+for (ii in seq_along(m_vec)) {
+m <- m_vec[ii]
+xm <- x_full[1:m, , , , drop=FALSE]
+spec <- estimate_spec_density_kernel(xm, B=B, eig_method=eig_method)
+
+
+S1 <- dim(xm)[2]; S2 <- dim(xm)[3]; TT <- dim(xm)[4]
+if (!use_5cube) {
+  idx1 <- 1:S1; idx2 <- 1:S2; idx3 <- 1:TT
+} else {
+  ss <- freq_subset_5cube(S1,S2,TT)
+  idx1 <- ss$i1; idx2 <- ss$i2; idx3 <- ss$i3
+}
+
+for (j in 1:(q+1)) out[ii,j] <- if (m>=j) mean(spec$eigvals[idx1,idx2,idx3,j]) else NA_real_
+if (ii %% 10 == 0) message("Fig1: done m=", m)
+
+
+}
+
+list(m=m_vec, avg_eig=out, q=q, B=B, use_5cube=use_5cube)
+}
+
+plot_fig_panel <- function(res, main=NULL, ylab="eigenvalues") {
+matplot(res$m, res$avg_eig, type="l", lty=1, lwd=2,
+xlab="m", ylab=ylab,
+main = if (is.null(main)) paste0("q=", res$q) else main)
+legend("topleft", legend=colnames(res$avg_eig), lty=1, lwd=2, bty="n")
+grid()
+}
+```
+
+
+ Run Figure 1 (q=2, q=3)
+
+```{r}
+
+# Choose ONE simulation mode:
+
+use_fast_torus <- TRUE
+
+if (use_fast_torus) {
+sim2 <- simulate_model_a_torusfft(n=100, q=2, S1=10, S2=10, T=100, seed=123, xi_sd=1)
+sim3 <- simulate_model_a_torusfft(n=100, q=3, S1=10, S2=10, T=100, seed=123, xi_sd=1)
+} else {
+sim2 <- simulate_model_a_trunc(n=100, q=2, S1=10, S2=10, T=100, K=6, seed=123, xi_sd=1)
+sim3 <- simulate_model_a_trunc(n=100, q=3, S1=10, S2=10, T=100, K=6, seed=123, xi_sd=1)
+}
+
+res2 <- fig1_curves(sim2$x, q=2, m_vec=1:100, B=c(2,2,2), use_5cube=FALSE, permute_once=TRUE)
+res3 <- fig1_curves(sim3$x, q=3, m_vec=1:100, B=c(2,2,2), use_5cube=FALSE, permute_once=TRUE)
+
+par(mfrow=c(1,2), mar=c(5,5,3,1))
+plot_fig_panel(res2, main="Figure 1-style (q=2)")
+plot_fig_panel(res3, main="Figure 1-style (q=3)")
+par(mfrow=c(1,1))
+```
+
+# General Dynamic Factor Models (GDFM)
+
+GDFM handle high‑dimensional time series but ignore spatial dependence. Simply stacking spatial series into one large vector destroys the lattice structure and can lead to spurious factors or loss of identification.
+
+##**Case 2: GDFM on stacked data (Figure 2)**  
+Stacking all space–time series into one vector \( x_{N,t} \) of dimension \( N = n \times S_1 \times S_2 \) and estimating a standard GDFM erases spatial structure. The resulting eigenvalues grow together with no clear gap, making the number of factors unidentifiable.
+
+ Figure 2-style curves (GDFM on stacked data): eigen-gap disappears
+We stack x into a T×N matrix and estimate a standard lag-window spectral density for the stacked series.
+```{r}
+
+# -------------------------------
+# Kernel
+# -------------------------------
+K_bartlett <- function(u) {
+  au <- abs(u)
+  ifelse(au <= 1, 1 - au, 0)
+}
+
+# -------------------------------
+# Stack x[n,S1,S2,T] -> Z[T,N]
+# -------------------------------
+stack_rf_to_ts <- function(x) {
+  stopifnot(length(dim(x)) == 4)
+  # x: n x S1 x S2 x T
+  matrix(aperm(x, c(4,1,2,3)),
+         nrow = dim(x)[4],
+         ncol = dim(x)[1]*dim(x)[2]*dim(x)[3])
+}
+
+# -------------------------------
+# Top-K eigenvalues for Hermitian complex matrix
+# using block-real representation (2m x 2m)
+# Memory-friendly: reuse preallocated Hreal
+# -------------------------------
+topK_hermitian_block_prealloc <- function(A, B, K = 10, Hreal = NULL) {
+  m <- nrow(A)
+  stopifnot(ncol(A) == m, all(dim(B) == c(m, m)))
+
+  n2 <- 2*m
+  if (is.null(Hreal) || nrow(Hreal) != n2) {
+    Hreal <- matrix(0, nrow = n2, ncol = n2)
+  }
+
+  # Fill blocks
+  Hreal[1:m, 1:m] <- A
+  Hreal[1:m, (m+1):(2*m)] <- -B
+  Hreal[(m+1):(2*m), 1:m] <- B
+  Hreal[(m+1):(2*m), (m+1):(2*m)] <- A
+
+  # Prefer RSpectra if available
+  use_rspectra <- requireNamespace("RSpectra", quietly = TRUE) && n2 >= 3
+
+  if (use_rspectra) {
+    k_eff <- min(2*K, n2 - 1)
+    vals <- RSpectra::eigs_sym(Hreal, k = k_eff, which = "LA")$values
+  } else {
+    vals <- eigen(Hreal, symmetric = TRUE, only.values = TRUE)$values
+  }
+
+  vals <- sort(vals, decreasing = TRUE)
+  vals <- vals[seq(1, length(vals), by = 2)]  # drop duplicates
+
+  if (length(vals) < K) vals <- c(vals, rep(NA_real_, K - length(vals)))
+
+  list(vals = vals[1:K], Hreal = Hreal)
+}
+
+# -------------------------------
+# Figure 2 curves (LOW-MEM)
+# Computes Gamma(h) only for current m
+# -------------------------------
+fig2_curves_lowmem <- function(x, K = 10, Bwin = 8, n_omega = 25,
+                               m_vec = NULL, kernel = K_bartlett,
+                               permute_once = FALSE, verbose_every = 10) {
+
+  Z <- stack_rf_to_ts(x)   # T x N
+  T <- nrow(Z)
+  N <- ncol(Z)
+
+  # Center each stacked series
+  Z <- scale(Z, center = TRUE, scale = FALSE)
+
+  if (permute_once) {
+    set.seed(1)
+    Z <- Z[, sample.int(N), drop = FALSE]
+  }
+
+  if (is.null(m_vec)) m_vec <- 1:N
+
+  # Select frequency subset
+  idx <- unique(round(seq(1, T, length.out = n_omega)))
+  omega <- 2*pi*(idx - 1)/T
+
+  # Precompute cos/sin tables
+  cos_tab <- array(0, dim = c(length(omega), Bwin))
+  sin_tab <- array(0, dim = c(length(omega), Bwin))
+  for (h in 1:Bwin) {
+    cos_tab[, h] <- cos(omega * h)
+    sin_tab[, h] <- sin(omega * h)
+  }
+
+  curves <- matrix(NA_real_, nrow = length(m_vec), ncol = K)
+  colnames(curves) <- paste0("lambda_", 1:K)
+
+  Hreal_cache <- NULL
+
+  for (ii in seq_along(m_vec)) {
+    m <- m_vec[ii]
+    Zm <- Z[, 1:m, drop = FALSE]
+
+    # Gamma(0)
+    G0 <- crossprod(Zm) / T
+
+    # Gamma(h), h = 1..Bwin
+    Gh_list <- vector("list", Bwin)
+    for (h in 1:Bwin) {
+      Gh_list[[h]] <- crossprod(Zm[(1+h):T, , drop = FALSE],
+                                Zm[1:(T-h), , drop = FALSE]) / T
+    }
+
+    eig_om <- matrix(NA_real_, nrow = length(omega), ncol = K)
+
+    for (kk in seq_along(omega)) {
+      # Build real/imag parts of S(omega)
+      A <- G0
+      Bmat <- matrix(0, nrow = m, ncol = m)
+
+      for (h in 1:Bwin) {
+        w <- kernel(h / Bwin)
+        if (w == 0) next
+
+        Gh <- Gh_list[[h]]
+        tGh <- t(Gh)
+
+        A    <- A    + w * (Gh + tGh) * cos_tab[kk, h]
+        Bmat <- Bmat + w * (tGh - Gh) * sin_tab[kk, h]
+      }
+
+      # Force perfect symmetry / skew-symmetry
+      A <- (A + t(A)) / 2
+      Bmat <- (Bmat - t(Bmat)) / 2
+
+      tmp <- topK_hermitian_block_prealloc(A, Bmat, K = K, Hreal = Hreal_cache)
+      eig_om[kk, ] <- tmp$vals
+      Hreal_cache <- tmp$Hreal
+    }
+
+    curves[ii, ] <- colMeans(eig_om, na.rm = TRUE)
+
+    if (!is.null(verbose_every) && (ii %% verbose_every == 0)) {
+      message("done m = ", m, " / ", max(m_vec))
+    }
+
+    rm(Zm, G0, Gh_list, eig_om)
+    gc()
+  }
+
+  list(m = m_vec, curves = curves, N = N, T = T, Bwin = Bwin, n_omega = n_omega)
+}
+
+# -------------------------------
+# Plot helper
+# -------------------------------
+plot_fig2 <- function(res, main = "") {
+  matplot(res$m, res$curves, type = "l", lty = 1, lwd = 2,
+          xlab = "m", ylab = "eigenvalues", main = main)
+  legend("topleft", legend = colnames(res$curves), lty = 1, lwd = 2, bty = "n")
+  grid()
+}
+
+
+```
+
+Run Figure 2
+
+```{r}
+
+# Use smaller n for stacked demo on laptops (paper uses N = n*S1*S2 huge)
+
+sim2_small <- simulate_model_a_torusfft(n=30, q=2, S1=10, S2=10, T=100, seed=123, xi_sd=1)
+sim3_small <- simulate_model_a_torusfft(n=30, q=3, S1=10, S2=10, T=100, seed=123, xi_sd=1)
+
+N <- 30*10*10
+m_vec <- unique(c(1:100, seq(120, N, by=20)))
+
+res2_gdfm <- fig2_curves_lowmem(sim2_small$x, K=10, Bwin=8, n_omega=25, m_vec=m_vec)
+res3_gdfm <- fig2_curves_lowmem(sim3_small$x, K=10, Bwin=8, n_omega=25, m_vec=m_vec)
+
+par(mfrow=c(1,2), mar=c(5,5,3,1))
+plot_fig2(res2_gdfm, main="Figure 2-style (q=2, stacked GDFM)")
+plot_fig2(res3_gdfm, main="Figure 2-style (q=3, stacked GDFM)")
+par(mfrow=c(1,1))
+```
+
+**Conclusion:** GSTFM explicitly models spatial dependence, allowing consistent identification of spatio‑temporal common factors; GDFM cannot.
+
+
+#  Algorithm 1: estimate common component 
+```{r}
+# ---------- Bartlett kernel ----------
+K_bartlett <- function(u) {
+  au <- abs(u)
+  ifelse(au <= 1, 1 - au, 0)
+}
+
+# ---------- Estimate Gamma_hat(h) for finite window ----------
+estimate_Gamma_lags <- function(x, BS1, BS2, BT) {
+  n  <- dim(x)[1]; S1 <- dim(x)[2]; S2 <- dim(x)[3]; T <- dim(x)[4]
+
+  h1_vals <- (-BS1):BS1
+  h2_vals <- (-BS2):BS2
+  h3_vals <- (-BT):BT
+
+  out <- vector("list", length(h1_vals)*length(h2_vals)*length(h3_vals))
+  idx <- 1L
+
+  for (h1 in h1_vals) for (h2 in h2_vals) for (h3 in h3_vals) {
+
+    s1_from <- max(1, 1 + h1); s1_to <- min(S1, S1 + h1)
+    s2_from <- max(1, 1 + h2); s2_to <- min(S2, S2 + h2)
+    t_from  <- max(1, 1 + h3); t_to  <- min(T,  T  + h3)
+
+    G <- matrix(0+0i, n, n)
+    count <- 0L
+
+    if (s1_from <= s1_to && s2_from <= s2_to && t_from <= t_to) {
+      for (s1 in s1_from:s1_to) for (s2 in s2_from:s2_to) for (tt in t_from:t_to) {
+        a <- x[, s1, s2, tt]
+        b <- x[, s1 - h1, s2 - h2, tt - h3]
+        G <- G + a %*% t(b)
+        count <- count + 1L
+      }
+      G <- G / count
+    }
+
+    out[[idx]] <- list(h = c(h1,h2,h3), G = G)
+    idx <- idx + 1L
+  }
+
+  out
+}
+
+# ---------- theta grid ----------
+theta_grid <- function(BS1, BS2, BT) {
+  th1 <- pi * (-BS1:BS1) / BS1
+  th2 <- pi * (-BS2:BS2) / BS2
+  th3 <- pi * (-BT:BT)   / BT
+  list(th1 = th1, th2 = th2, th3 = th3)
+}
+
+# ---------- Sigma_hat(theta) ----------
+Sigma_hat_at_theta <- function(Gamma_list, theta, BS1, BS2, BT,
+                               K1 = K_bartlett, K2 = K_bartlett, K3 = K_bartlett) {
+  n <- nrow(Gamma_list[[1]]$G)
+  Sig <- matrix(0+0i, n, n)
+
+  for (it in seq_along(Gamma_list)) {
+    h <- Gamma_list[[it]]$h
+
+    w <- K1(h[1]/BS1) * K2(h[2]/BS2) * K3(h[3]/BT)
+    if (w == 0) next
+
+    phase <- exp(-1i * (h[1]*theta[1] + h[2]*theta[2] + h[3]*theta[3]))
+    Sig <- Sig + w * Gamma_list[[it]]$G * phase
+  }
+
+  (Sig + Conj(t(Sig))) / 2
+}
+
+# ---------- projector top-q ----------
+projector_top_q <- function(Sigma, q) {
+  ee <- eigen(Sigma, symmetric = FALSE)
+  ord <- order(Re(ee$values), decreasing = TRUE)
+  Vq <- ee$vectors[, ord[1:q], drop = FALSE]
+  Vq %*% Conj(t(Vq))
+}
+
+# ---------- filter coefficients ----------
+compute_filter_coeffs_one_ell <- function(Ktheta_mat, BS1, BS2, BT, MS1, MS2, MT) {
+  grid <- theta_grid(BS1, BS2, BT)
+  th1 <- grid$th1; th2 <- grid$th2; th3 <- grid$th3
+
+  thetas <- vector("list", length(th1)*length(th2)*length(th3))
+  H <- 1L
+  for (a in seq_along(th1)) for (b in seq_along(th2)) for (c in seq_along(th3)) {
+    thetas[[H]] <- c(th1[a], th2[b], th3[c]); H <- H + 1L
+  }
+
+  n <- ncol(Ktheta_mat)
+  Cw <- array(0+0i, dim = c(2*MS1+1, 2*MS2+1, 2*MT+1, n))
+  weight <- 1 / (8 * BS1 * BS2 * BT)
+
+  k1_vals <- (-MS1):MS1
+  k2_vals <- (-MS2):MS2
+  k3_vals <- (-MT):MT
+
+  for (i1 in seq_along(k1_vals)) for (i2 in seq_along(k2_vals)) for (i3 in seq_along(k3_vals)) {
+    kappa <- c(k1_vals[i1], k2_vals[i2], k3_vals[i3])
+    acc <- rep(0+0i, n)
+
+    for (h in seq_along(thetas)) {
+      th <- thetas[[h]]
+      acc <- acc + Ktheta_mat[h, ] * exp(1i * (kappa[1]*th[1] + kappa[2]*th[2] + kappa[3]*th[3]))
+    }
+    Cw[i1, i2, i3, ] <- weight * acc
+  }
+
+  list(Cw = Cw, k1 = k1_vals, k2 = k2_vals, k3 = k3_vals)
+}
+
+# ---------- apply filter ----------
+apply_filter_one_ell <- function(x, coeff, ell, MS1, MS2, MT) {
+  n  <- dim(x)[1]; S1 <- dim(x)[2]; S2 <- dim(x)[3]; T <- dim(x)[4]
+  Cw <- coeff$Cw; k1v <- coeff$k1; k2v <- coeff$k2; k3v <- coeff$k3
+
+  out <- array(0, dim = c(S1, S2, T))
+
+  map1 <- setNames(seq_along(k1v), as.character(k1v))
+  map2 <- setNames(seq_along(k2v), as.character(k2v))
+  map3 <- setNames(seq_along(k3v), as.character(k3v))
+
+  for (s1 in 1:S1) for (s2 in 1:S2) for (tt in 1:T) {
+    k1_min <- max(s1 - S1, -MS1); k1_max <- min(s1 - 1, MS1)
+    k2_min <- max(s2 - S2, -MS2); k2_max <- min(s2 - 1, MS2)
+    k3_min <- max(tt - T,  -MT ); k3_max <- min(tt - 1, MT)
+
+    acc <- 0+0i
+    for (k1 in k1_min:k1_max) for (k2 in k2_min:k2_max) for (k3 in k3_min:k3_max) {
+      i1 <- map1[[as.character(k1)]]
+      i2 <- map2[[as.character(k2)]]
+      i3 <- map3[[as.character(k3)]]
+
+      wvec <- Cw[i1, i2, i3, ]
+      xvec <- x[, s1 - k1, s2 - k2, tt - k3]
+      acc <- acc + sum(wvec * xvec)
+    }
+
+    out[s1, s2, tt] <- Re(acc)
+  }
+
+  out
+}
+
+# ---------- Algorithm 1 wrapper ----------
+gstfm_algorithm1 <- function(x, q_hat, BS1, BS2, BT, MS1, MS2, MT,
+                             K1 = K_bartlett, K2 = K_bartlett, K3 = K_bartlett,
+                             verbose = TRUE) {
+
+  stopifnot(length(dim(x)) == 4)
+  n <- dim(x)[1]
+
+  # center each series
+  for (ell in 1:n) x[ell,,,] <- x[ell,,,] - mean(x[ell,,,], na.rm = TRUE)
+
+  if (q_hat == 0) return(array(0, dim = dim(x)))
+
+  if (verbose) message("Alg1: estimating Gamma_hat(h)...")
+  Gamma_list <- estimate_Gamma_lags(x, BS1, BS2, BT)
+
+  grid <- theta_grid(BS1, BS2, BT)
+  th1 <- grid$th1; th2 <- grid$th2; th3 <- grid$th3
+  Htot <- length(th1)*length(th2)*length(th3)
+
+  Ktheta_list <- vector("list", n)
+  for (ell in 1:n) Ktheta_list[[ell]] <- matrix(0+0i, nrow = Htot, ncol = n)
+
+  if (verbose) message("Alg1: building Sigma_hat(theta_h) + projectors...")
+  hidx <- 1L
+  for (a in seq_along(th1)) for (b in seq_along(th2)) for (c in seq_along(th3)) {
+    theta <- c(th1[a], th2[b], th3[c])
+    Sig <- Sigma_hat_at_theta(Gamma_list, theta, BS1, BS2, BT, K1, K2, K3)
+    Proj <- projector_top_q(Sig, q_hat)
+    for (ell in 1:n) Ktheta_list[[ell]][hidx, ] <- Proj[ell, ]
+    hidx <- hidx + 1L
+  }
+
+  if (verbose) message("Alg1: converting to truncated filters + applying...")
+  chi_hat <- array(0, dim = dim(x))
+
+  for (ell in 1:n) {
+    if (verbose) message(sprintf("  ell=%d/%d", ell, n))
+    coeff <- compute_filter_coeffs_one_ell(Ktheta_list[[ell]], BS1, BS2, BT, MS1, MS2, MT)
+    chi_hat[ell,,,] <- apply_filter_one_ell(x, coeff, ell, MS1, MS2, MT)
+  }
+
+  chi_hat
+}
+
+```
+
+
+
+
+
+# Choosing q-ty of common components (q)
+
+
+
+```{r}
+avg_eigs_over_theta_grid <- function(x, BS1, BS2, BT,
+K1=K_bartlett, K2=K_bartlett, K3=K_bartlett) {
+n <- dim(x)[1]
+Gamma_list <- estimate_Gamma_lags(x, BS1, BS2, BT)
+grid <- theta_grid(BS1, BS2, BT)
+th1 <- grid$th1; th2 <- grid$th2; th3 <- grid$th3
+
+lam_sum <- rep(0, n)
+Htot <- length(th1)*length(th2)*length(th3)
+
+for (a in seq_along(th1)) for (b in seq_along(th2)) for (c in seq_along(th3)) {
+Sig <- Sigma_hat_at_theta(Gamma_list, c(th1[a],th2[b],th3[c]), BS1, BS2, BT, K1,K2,K3)
+lam <- sort(Re(eigen(Sig, symmetric=FALSE, only.values=TRUE)$values), decreasing=TRUE)
+lam_sum <- lam_sum + lam
+}
+lam_sum / Htot
+}
+# 
+# # demo on a smaller simulated object for speed
+# 
+# sim_small <- simulate_model_a_torusfft(n=30, q=2, S1=10, S2=10, T=80, seed=1)
+# x0 <- sim_small$x
+# 
+# BS1 <- 2; BS2 <- 2; BT <- 2
+# lam_bar <- avg_eigs_over_theta_grid(x0, BS1, BS2, BT)
+
+# plot(lam_bar, type="b", xlab="j", ylab="avg eigenvalue", main="Avg eigenvalues over theta grid")
+qmax <- min(10, length(lam_bar)-1)
+drops <- lam_bar[1:qmax] - lam_bar[2:(qmax+1)]
+q_hat_suggested <- which.max(drops)
+# q_hat_suggested
+```
+
+```{r}
+
+out_dir <- file.path(getwd(), paste0("gstfm_saved_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+out_dir
+```
+
+```{r}
+save.image(file = file.path(out_dir, "workspace_snapshot.RData"))
+```
+
+<!-- # ```{r} -->
+<!-- #  -->
+<!-- # load(".../workspace_snapshot.RData") -->
+<!-- #  -->
+<!-- #  -->
+<!-- # ``` -->
+
+
+```{r}
+pdf(file.path(out_dir, "Figure1_panels.pdf"), width = 12, height = 5)
+par(mfrow=c(1,2), mar=c(5,5,3,1))
+plot_fig_panel(res2, main="Figure 1-style (q=2)")
+plot_fig_panel(res3, main="Figure 1-style (q=3)")
+par(mfrow=c(1,1))
+dev.off()
+
+pdf(file.path(out_dir, "Figure2_panels.pdf"), width = 12, height = 5)
+par(mfrow=c(1,2), mar=c(5,5,3,1))
+plot_fig2(res2_gdfm, main="Figure 2-style (q=2, stacked)")
+plot_fig2(res3_gdfm, main="Figure 2-style (q=3, stacked)")
+par(mfrow=c(1,1))
+dev.off()
+
+
+# EV if you computed it
+if (exists("EV")) {
+  write.csv(data.frame(EV = EV),
+            file.path(out_dir, "EV_summary.csv"),
+            row.names = FALSE)
+}
+
+# eigen curves from fig1 (avg eig vs m)
+if (exists("res2") && exists("res3")) {
+  write.csv(data.frame(m = res2$m, res2$avg_eig),
+            file.path(out_dir, "fig1_q2_avg_eigs.csv"),
+            row.names = FALSE)
+  write.csv(data.frame(m = res3$m, res3$avg_eig),
+            file.path(out_dir, "fig1_q3_avg_eigs.csv"),
+            row.names = FALSE)
+}
+
+# eigen curves from fig2 stacked
+if (exists("res2_gdfm") && exists("res3_gdfm")) {
+  write.csv(data.frame(m = res2_gdfm$m, res2_gdfm$curves),
+            file.path(out_dir, "fig2_q2_curves.csv"),
+            row.names = FALSE)
+  write.csv(data.frame(m = res3_gdfm$m, res3_gdfm$curves),
+            file.path(out_dir, "fig2_q3_curves.csv"),
+            row.names = FALSE)
+}
+
+
+writeLines(capture.output(sessionInfo()),
+           con = file.path(out_dir, "sessionInfo.txt"))
+
+list.files(out_dir)
+
+```
+
+
+
+
+# Real data (WeatherBench2)  application. 
+
+
+```{r}
+Sys.setenv(RETICULATE_PYTHON =
+  "/Users/dana/Library/r-miniconda-arm64/envs/wb2/bin/python"
+)
+
+library(reticulate)
+py_config()
+
+
+```
+
+```{r}
+load("/Users/dana/Documents/TS econometrics/gstfm_saved_20260115_070311/workspace_snapshot.RData")
+
+```
+
+
+```{r}
+
+py_config()
+```
+
+```{r}
+
+py_module_available("xarray")
+py_module_available("gcsfs")
+
+```
+
+
+
+```{r}
+
+library(reticulate)
+
+env <- "wb2"
+conda_create(envname=env, packages="python=3.11")
+conda_install(envname=env, packages=c("xarray","zarr","numpy","fsspec","gcsfs"), pip=TRUE)
+use_condaenv(env, required=TRUE)
+py_config()
+
+xr <- import("xarray")
+builtins <- import("builtins")
+slice <- builtins$slice
+
+path <- "gs://weatherbench2/datasets/era5/1959-2023_01_10-6h-240x121_equiangular_with_poles_conservative.zarr"
+ds <- xr$open_zarr(path, storage_options = dict(token = "anon"))
+
+var_names <- py_to_r(builtins$list(ds$data_vars$keys()))
+
+# Choose variables with (time, level, latitude, longitude)
+
+is_4d_tll <- function(v) {
+da <- ds[[v]]
+dims <- py_to_r(da$dims)
+all(c("time","level","latitude","longitude") %in% dims)
+}
+cand <- var_names[vapply(var_names, is_4d_tll, logical(1))]
+
+# quick variability screen on a tiny subset
+
+var_screen <- function(v) {
+da <- ds[[v]]$isel(time=as.integer(0:10), level=as.integer(0),
+latitude=as.integer(0:10), longitude=as.integer(0:10))
+vals <- py_to_r(da$values)
+c(sd=sd(as.vector(vals), na.rm=TRUE))
+}
+sds <- sapply(cand, var_screen)
+cand_ok <- cand[is.finite(sds) & sds > 1e-8]
+cand_ok
+```
+
+<!-- What each variable represents (quick interpretation) -->
+<!-- Here’s what your list corresponds to physically: -->
+<!-- temperature → air temperature at pressure levels -->
+<!-- geopotential → gravitational potential energy per unit mass (ERA5 stores in m²/s²) -->
+<!-- u_component_of_wind → zonal wind (east–west component, m/s) -->
+<!-- v_component_of_wind → meridional wind (north–south component, m/s) -->
+<!-- wind_speed → magnitude of horizontal wind (m/s) -->
+<!-- relative_humidity → humidity (often in fraction or kg/kg depending on dataset) -->
+<!-- specific_humidity → mass of water vapor per unit mass of air -->
+<!-- vertical_velocity → upward/downward motion (Pa/s in pressure coordinates) -->
+<!-- vorticity → rotation of the flow -->
+<!-- divergence → expansion/contraction of the flow -->
+<!-- lapse_rate → vertical temperature gradient proxy -->
+
+
+
+```{r}
+
+# ============================================================
+# 0) Choose variables + subset dimensions
+# ============================================================
+vars_use <- c("temperature", "geopotential",
+              "u_component_of_wind", "v_component_of_wind")
+
+stopifnot(all(vars_use %in% cand_ok))  # cand_ok from your screening
+
+# Choose time window (keep small at first)
+t0 <- "2010-01-01"
+t1 <- "2010-01-31"
+
+# Choose region (Europe-ish example)
+lat_min <- 35
+lat_max <- 70
+lon_min <- 0
+lon_max <- 40
+
+# Choose how many pressure levels (start small for speed)
+lev_all <- py_to_r(ds[["level"]]$values)
+lev_sel <- lev_all[1:min(8, length(lev_all))]   # e.g. first 8 levels
+lev_sel
+```
+
+```{r}
+library(reticulate)
+if (!requireNamespace("abind", quietly = TRUE)) install.packages("abind")
+library(abind)
+
+builtins <- import("builtins")
+slice <- builtins$slice
+
+# --- detect latitude order (ERA5 often stored descending) ---
+lat_vals <- py_to_r(ds[["latitude"]]$values)
+lat_desc <- lat_vals[1] > lat_vals[length(lat_vals)]
+lat_slice <- if (lat_desc) slice(lat_max, lat_min) else slice(lat_min, lat_max)
+
+# --- helper: fetch one variable block as [levels, S1, S2, T] ---
+get_block <- function(v) {
+  da <- ds[[v]]$sel(
+    time      = slice(t0, t1),
+    level     = as.integer(lev_sel),
+    latitude  = lat_slice,
+    longitude = slice(lon_min, lon_max)
+  )$transpose("level", "latitude", "longitude", "time")
+
+  arr <- py_to_r(da$values)
+  storage.mode(arr) <- "double"
+  stopifnot(all(is.finite(arr)))
+  arr
+}
+
+blocks <- lapply(vars_use, get_block)
+
+# sanity check: all blocks must have same spatial/time dimensions
+dims_list <- lapply(blocks, dim)
+print(dims_list)
+
+# stack along "series" dimension -> x[n, S1, S2, T]
+# n = (#vars) * (#levels)
+x_raw <- abind(blocks[[1]], blocks[[2]], blocks[[3]], blocks[[4]], along = 1)
+
+dim(x_raw)
+# expected: n = length(vars_use)*length(lev_sel)
+```
+
+
+```{r}
+library(reticulate)
+if (!requireNamespace("abind", quietly = TRUE)) install.packages("abind")
+library(abind)
+
+builtins <- import("builtins")
+slice <- builtins$slice
+
+# --- detect latitude order (ERA5 often stored descending) ---
+lat_vals <- py_to_r(ds[["latitude"]]$values)
+lat_desc <- lat_vals[1] > lat_vals[length(lat_vals)]
+lat_slice <- if (lat_desc) slice(lat_max, lat_min) else slice(lat_min, lat_max)
+
+# --- helper: fetch one variable block as [levels, S1, S2, T] ---
+get_block <- function(v) {
+  da <- ds[[v]]$sel(
+    time      = slice(t0, t1),
+    level     = as.integer(lev_sel),
+    latitude  = lat_slice,
+    longitude = slice(lon_min, lon_max)
+  )$transpose("level", "latitude", "longitude", "time")
+
+  arr <- py_to_r(da$values)
+  storage.mode(arr) <- "double"
+  stopifnot(all(is.finite(arr)))
+  arr
+}
+
+blocks <- lapply(vars_use, get_block)
+
+# sanity check: all blocks must have same spatial/time dimensions
+dims_list <- lapply(blocks, dim)
+print(dims_list)
+
+# stack along "series" dimension -> x[n, S1, S2, T]
+# n = (#vars) * (#levels)
+x_raw <- abind(blocks[[1]], blocks[[2]], blocks[[3]], blocks[[4]], along = 1)
+
+dim(x_raw)
+# expected: n = length(vars_use)*length(lev_sel)
+```
+
+
+Preprocess
+```{r}
+x_sc <- x_raw
+
+for (ell in 1:dim(x_sc)[1]) {
+  v <- as.vector(x_sc[ell,,,])
+  x_sc[ell,,,] <- (x_sc[ell,,,] - mean(v, na.rm=TRUE)) / sd(v, na.rm=TRUE)
+}
+
+stopifnot(all(is.finite(x_sc)))
+dim(x_sc)
+```
+Choose bandwidths and truncation
+```{r}
+
+
+S1 <- dim(x_sc)[2]
+S2 <- dim(x_sc)[3]
+TT <- dim(x_sc)[4]
+
+# safe small defaults (fast)
+BS1 <- 2; BS2 <- 2; BT <- 2
+MS1 <- 1; MS2 <- 1; MT <- 1
+
+c(BS1=BS1, BS2=BS2, BT=BT, MS1=MS1, MS2=MS2, MT=MT)
+```
+
+
+```{r}
+lam_bar <- avg_eigs_over_theta_grid(x_sc, BS1, BS2, BT)
+
+plot(lam_bar, type="b", xlab="j", ylab="avg eigenvalue",
+     main="Avg eigenvalues over theta grid")
+
+qmax <- min(10, length(lam_bar)-1)
+drops <- lam_bar[1:qmax] - lam_bar[2:(qmax+1)]
+q_hat <- which.max(drops)
+
+q_hat
+```
+```{r}
+pdf("avg_eigenvalues_plot.pdf", width = 6, height = 4)
+
+plot(lam_bar, type="b",
+     xlab="j", ylab="avg eigenvalue",
+     main="Avg eigenvalues over theta grid")
+
+dev.off()
+```
+
+
+Run GSTFM Algorithm 1 (common component estimation)
+```{r}
+
+chi_hat <- gstfm_algorithm1(
+  x_sc,
+  q_hat = q_hat,
+  BS1 = BS1, BS2 = BS2, BT = BT,
+  MS1 = MS1, MS2 = MS2, MT = MT,
+  verbose = TRUE
+)
+
+xi_hat <- x_sc - chi_hat
+dim(chi_hat)
+
+# dim(chi_hat) = (n=32, S1=23, S2=27, T=124)
+```
+
+Run GSTFM Algorithm 1 (common component estimation)
+
+```{r}
+EV <- sum(chi_hat^2) / sum(x_sc^2)
+EV
+# the common component explains ~85% of variance in your standardized WeatherBench data
+```
+
+Visual diagnostics (time series + spatial snapshot)
+```{r}
+ell <- 1
+s1 <- ceiling(dim(x_sc)[2]/2)
+s2 <- ceiling(dim(x_sc)[3]/2)
+
+# ts_x   <- x_sc[ell, s1, s2, ]
+# ts_chi <- chi_hat[ell, s1, s2
+ts_x   <- x_sc[ell, s1, s2, ]
+ts_chi <- chi_hat[ell, s1, s2, ]
+ts_xi  <- xi_hat[ell, s1, s2, ]
+```
+
+```{r}
+
+pdf("ts_diagnostic_ell1.pdf", width = 7, height = 5)
+
+plot(ts_x, type="l", col="black", lwd=2,
+     main=paste0("One location: x vs common vs idiosyncratic (ell=", ell, ")"),
+     xlab="t index", ylab="value")
+
+lines(ts_chi, col="blue", lwd=2)
+lines(ts_xi,  col="red",  lwd=2)
+
+legend("topright",
+       legend=c("x", "common", "idio"),
+       col=c("black","blue","red"),
+       lty=1, lwd=2, bty="n")
+
+grid()
+
+
+dev.off()
+
+```
+
+
+````{r}
+
+pdf("spatial_snapshots_ell1_t10.pdf", width = 7, height = 10)
+
+par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))  # 3 rows, 1 column
+
+tt <- 10
+
+image(x_sc[ell, , , tt],
+      main = paste0("x snapshot (ell=", ell, ", t=", tt, ")"),
+      xlab = "lon index", ylab = "lat index")
+
+image(chi_hat[ell, , , tt],
+      main = paste0("common snapshot (ell=", ell, ", t=", tt, ")"),
+      xlab = "lon index", ylab = "lat index")
+
+image(xi_hat[ell, , , tt],
+      main = paste0("idio snapshot (ell=", ell, ", t=", tt, ")"),
+      xlab = "lon index", ylab = "lat index")
+
+dev.off()
+
+# reset layout back to normal
+par(mfrow = c(1, 1))
+
+````
+
+# ```{r}
+# 
+# BS1 <- 6; BS2 <- 6; BT <- 6
+# MS1 <- 5; MS2 <- 5; MT <- 5
+# 
+# 
+# 
+# c(BS1=BS1, BS2=BS2, BT=BT, MS1=MS1, MS2=MS2, MT=MT)
+# ```
+
+Bandwidth choice is very small (BS1=BS2=BT=2)
+# ```{r}
+# lam_bar <- avg_eigs_over_theta_grid(x_sc, BS1, BS2, BT)
+# 
+# # plot(lam_bar, type="b", xlab="j", ylab="avg eigenvalue",
+# #      main="Avg eigenvalues over theta grid")
+# 
+# qmax <- min(10, length(lam_bar)-1)
+# drops <- lam_bar[1:qmax] - lam_bar[2:(qmax+1)]
+# q_hat <- which.max(drops)
+# 
+# q_hat
+# ```
+
+
+
+```{r}
+
+chi_hat <- gstfm_algorithm1(
+  x_sc,
+  q_hat = q_hat,
+  BS1 = BS1, BS2 = BS2, BT = BT,
+  MS1 = MS1, MS2 = MS2, MT = MT,
+  verbose = TRUE
+)
+
+xi_hat <- x_sc - chi_hat
+dim(chi_hat)
+
+# dim(chi_hat) = (n=32, S1=23, S2=27, T=124)
+```
+
+
